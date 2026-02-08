@@ -10,6 +10,7 @@ Or set BASILICA_API_TOKEN as an environment variable.
 """
 
 import base64
+import functools
 import io
 import os
 import random
@@ -396,11 +397,15 @@ JOKE_PAGE_HTML = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bittensor Roast</title>
+  <meta property="og:type" content="website">
   <meta property="og:title" content="Bittensor Roast Machine">
   <meta property="og:description" content="{{ joke }}">
   <meta property="og:image" content="{{ site_url }}/joke/{{ joke_id }}/image">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
   <meta property="og:url" content="{{ site_url }}/joke/{{ joke_id }}">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:site" content="@bitsecai">
   <meta name="twitter:title" content="Bittensor Roast Machine">
   <meta name="twitter:description" content="{{ joke }}">
   <meta name="twitter:image" content="{{ site_url }}/joke/{{ joke_id }}/image">
@@ -518,42 +523,64 @@ def joke_permalink(joke_id: str):
 # OG image generation (Pillow)
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=256)
+def _render_joke_image(joke_text: str) -> bytes:
+    """Render a joke as a branded PNG. Cached in memory (up to 256 images)."""
+    W, H = 1200, 630
+    img = Image.new("RGB", (W, H), "#0f0f1a")
+    draw = ImageDraw.Draw(img)
+
+    # Subtle gradient: deep black to slightly warm black
+    for y in range(H):
+        frac = y / H
+        r = int(10 + frac * 15)
+        g = int(10 + frac * 8)
+        b = int(10 + frac * 5)
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+    # Orange accent line at top
+    draw.rectangle([(0, 0), (W, 4)], fill="#f57c20")
+
+    font_title = ImageFont.load_default(size=42)
+    font_body = ImageFont.load_default(size=34)
+    font_quote = ImageFont.load_default(size=120)
+    font_footer = ImageFont.load_default(size=22)
+
+    # Big decorative quote mark in orange
+    draw.text((60, 80), "\u201c", fill="#f57c2060", font=font_quote)
+
+    # Title in orange
+    title = "Bittensor Roast Machine"
+    bbox = draw.textbbox((0, 0), title, font=font_title)
+    draw.text(((W - bbox[2]) / 2, 36), title, fill="#f57c20", font=font_title)
+
+    # Joke text — white, word-wrapped and vertically centered
+    wrapped = textwrap.fill(joke_text, width=42)
+    bbox = draw.textbbox((0, 0), wrapped, font=font_body)
+    text_h = bbox[3] - bbox[1]
+    y_start = max(140, (H - text_h) / 2 - 10)
+    draw.text((120, y_start), wrapped, fill="white", font=font_body)
+
+    # Divider line above footer
+    draw.line([(100, H - 80), (W - 100, H - 80)], fill="#333333", width=1)
+
+    # Footer
+    footer = "@bitsecai  x  @basilic_ai"
+    bbox = draw.textbbox((0, 0), footer, font=font_footer)
+    draw.text(((W - bbox[2]) / 2, H - 55), footer, fill="#999999", font=font_footer)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 @app.route("/joke/<joke_id>/image")
 def joke_image(joke_id: str):
     data = _load_joke(joke_id)
     if not data:
         abort(404)
-
-    W, H = 1200, 630
-    img = Image.new("RGB", (W, H), "#0f0f1a")
-    draw = ImageDraw.Draw(img)
-
-    font_title = ImageFont.load_default(size=48)
-    font_body = ImageFont.load_default(size=36)
-    font_footer = ImageFont.load_default(size=24)
-
-    # Title
-    title = "Bittensor Roast Machine"
-    bbox = draw.textbbox((0, 0), title, font=font_title)
-    draw.text(((W - bbox[2]) / 2, 40), title, fill="#e0e0e0", font=font_title)
-
-    # Joke text — word-wrapped
-    joke_text = data["joke"]
-    wrapped = textwrap.fill(joke_text, width=45)
-    bbox = draw.textbbox((0, 0), wrapped, font=font_body)
-    text_h = bbox[3] - bbox[1]
-    y_start = (H - text_h) / 2
-    draw.text((80, y_start), wrapped, fill="white", font=font_body)
-
-    # Footer
-    footer = "@bitsecai x @basilic_ai"
-    bbox = draw.textbbox((0, 0), footer, font=font_footer)
-    draw.text(((W - bbox[2]) / 2, H - 60), footer, fill="#555555", font=font_footer)
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return Response(buf.getvalue(), mimetype="image/png")
+    png = _render_joke_image(data["joke"])
+    return Response(png, mimetype="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 ALL_JOKES_HTML = """
