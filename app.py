@@ -3,31 +3,27 @@
 Basilica Joke Generator — deploys a vLLM model and serves jokes on a webpage.
 
 Usage:
-    export BASILICA_API_TOKEN="basilica_..."
+    echo 'BASILICA_API_TOKEN=basilica_...' > .env
     python app.py
 
-Or reads the token from basilica_api_token.json automatically.
+Or set BASILICA_API_TOKEN as an environment variable.
 """
 
-import json
 import os
 import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string
 from openai import OpenAI
 from basilica import BasilicaClient
 
 # ---------------------------------------------------------------------------
-# Auth: load API token from env or local JSON file
+# Auth: load API token from env or .env file
 # ---------------------------------------------------------------------------
-TOKEN_FILE = Path(__file__).parent / "basilica_api_token.json"
-
-if not os.environ.get("BASILICA_API_TOKEN") and TOKEN_FILE.exists():
-    token_data = json.loads(TOKEN_FILE.read_text())
-    os.environ["BASILICA_API_TOKEN"] = token_data["token"]
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Connect to existing deployment, or deploy a new one
