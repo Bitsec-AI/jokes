@@ -113,6 +113,7 @@ def _parse_joke_file(f: Path) -> dict:
         d, t = ts_match.groups()
         time_str = f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]} UTC"
     return {
+        "id": f.stem,
         "joke": joke_match.group(1).strip() if joke_match else "(parse error)",
         "style": style_match.group(1).strip() if style_match else "",
         "time": time_str,
@@ -195,7 +196,7 @@ HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">BitSec</a> &middot; Qwen3-0.6B Inference by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a></p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-0.6B</p>
     <div id="joke" class="empty">Click the button to get roasted, subnet owner.</div>
     <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
       <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
@@ -245,7 +246,7 @@ HTML = """
         await fetch('/api/share/' + currentJokeId, {method: 'POST'});
       } catch (e) { /* best effort */ }
       const permalink = '{{ site_url }}/joke/' + currentJokeId;
-      const text = currentJokeText + '\n\nvia @bitsecai x @basilic_ai';
+      const text = currentJokeText + String.fromCharCode(10,10) + 'via @bitsecai x @basilic_ai';
       const intentUrl = 'https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink);
       window.open(intentUrl, '_blank');
       shareBtn.disabled = false;
@@ -449,25 +450,50 @@ JOKE_PAGE_HTML = """
       transition: opacity 0.2s;
     }
     a.btn:hover { opacity: 0.85; }
+    .btn-share {
+      display: inline-block;
+      background: linear-gradient(135deg, #1da1f2, #0d8ecf);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 14px 32px;
+      font-size: 1rem;
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.2s;
+    }
+    .btn-share:hover { opacity: 0.85; color: white; }
     .footer { margin-top: 24px; color: #555; font-size: 0.75rem; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">BitSec</a> &middot; Qwen3-0.6B Inference by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a></p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-0.6B</p>
     <div class="joke-text">{{ joke }}</div>
     <div class="joke-meta">
       <span>{{ style }}</span>
       <span>{{ time }}</span>
     </div>
-    <a class="btn" href="/">Get roasted</a>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+      <a class="btn" href="/">Get roasted</a>
+      <a class="btn-share" id="share-btn" href="#" onclick="sharePage(event)">Share on X</a>
+    </div>
     <p class="footer">
       <a href="/all-jokes" style="color:#6c3ce0;text-decoration:none;">View all roasts</a>
       &middot; <a href="https://github.com/Bitsec-AI/jokes" style="color:#6c3ce0;text-decoration:none;">GitHub</a>
       &middot; TAO bless
     </p>
   </div>
+  <script>
+    function sharePage(e) {
+      e.preventDefault();
+      var jokeText = document.querySelector('.joke-text').textContent;
+      var permalink = '{{ site_url }}/joke/{{ joke_id }}';
+      var text = jokeText + String.fromCharCode(10,10) + 'via @bitsecai x @basilic_ai';
+      window.open('https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink), '_blank');
+    }
+  </script>
 </body>
 </html>
 """
@@ -583,6 +609,7 @@ ALL_JOKES_HTML = """
     .pagination a:hover { border-color: #6c3ce0; text-decoration: none; }
     .pagination .disabled { color: #333; padding: 8px 16px; font-size: 0.85rem; }
     .page-info { color: #888; font-size: 0.85rem; }
+    .share-link { color: #1da1f2 !important; margin-left: 8px; }
   </style>
 </head>
 <body>
@@ -612,6 +639,7 @@ ALL_JOKES_HTML = """
         <div class="joke-meta">
           <span>{{ j.style }}</span>
           <span>{{ j.time }}</span>
+          <a href="#" class="share-link" onclick="shareFromList('{{ j.id }}', this, event)">Share on X</a>
         </div>
       </div>
       {% endfor %}
@@ -634,6 +662,21 @@ ALL_JOKES_HTML = """
     </div>
     {% endif %}
   </div>
+  <script>
+    async function shareFromList(jokeId, el, e) {
+      e.preventDefault();
+      const card = el.closest('.joke-card');
+      const jokeText = card.querySelector('.joke-text').textContent;
+      el.textContent = 'Saving…';
+      try {
+        await fetch('/api/share/' + jokeId, {method: 'POST'});
+      } catch (err) { /* best effort */ }
+      const permalink = '{{ site_url }}/joke/' + jokeId;
+      const text = jokeText + String.fromCharCode(10,10) + 'via @bitsecai x @basilic_ai';
+      window.open('https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink), '_blank');
+      el.textContent = 'Share on X';
+    }
+  </script>
 </body>
 </html>
 """
@@ -673,6 +716,7 @@ def all_jokes():
         total_pages=total_pages,
         style_filter=style_filter,
         techniques=TECHNIQUES,
+        site_url=SITE_URL,
     )
 
 
