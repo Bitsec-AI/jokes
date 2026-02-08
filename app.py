@@ -34,29 +34,32 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Connect to existing deployment, or deploy a new one
 # ---------------------------------------------------------------------------
-MODEL = "Qwen/Qwen3-4B"
+MODEL = "Qwen/Qwen3-0.6B"
 
 _llm = None
 
 
 def _get_llm():
-    """Lazy-init Basilica connection on first /api/joke request."""
+    """Connect to an existing active Basilica deployment.
+
+    Does NOT deploy a new model — that must be done externally
+    (e.g. via `basilica deploy` CLI or a management script) to
+    avoid blocking gunicorn workers for minutes.
+    """
     global _llm
     if _llm is not None:
         return _llm
     client = BasilicaClient()
-    deployment = None
     for d in client.list_deployments().deployments:
         if d.state == "Active":
-            deployment = client.get(d.instance_name)
-            print(f"Reusing existing deployment: {deployment.url}")
-            break
-    if deployment is None:
-        print(f"Deploying {MODEL} … (this may take a few minutes)")
-        deployment = client.deploy_vllm(model=MODEL, name="joke-generator", ttl_seconds=3600)
-        print(f"Model ready at {deployment.url}")
-    _llm = OpenAI(base_url=f"{deployment.url}/v1", api_key="not-needed")
-    return _llm
+            dep = client.get(d.instance_name)
+            _llm = OpenAI(base_url=f"{dep.url}/v1", api_key="not-needed")
+            print(f"Connected to deployment: {dep.url}")
+            return _llm
+    raise RuntimeError(
+        f"No active Basilica deployment found. "
+        f"Deploy one first: basilica deploy vllm --model {MODEL}"
+    )
 
 # ---------------------------------------------------------------------------
 # Load factoids and example jokes
@@ -227,7 +230,7 @@ HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-4B</p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-0.6B</p>
     <div id="joke" class="empty">Click the button to get roasted, subnet owner.</div>
     <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
       <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
@@ -257,12 +260,14 @@ HTML = """
         const data = await res.json();
         box.className = '';
         box.textContent = data.joke;
-        currentJokeId = data.id;
-        currentJokeText = data.joke;
-        shareBtn.style.display = 'inline-block';
+        if (data.id) {
+          currentJokeId = data.id;
+          currentJokeText = data.joke;
+          shareBtn.style.display = 'inline-block';
+        }
       } catch (err) {
         box.className = '';
-        box.textContent = 'Oops, something went wrong. Try again!';
+        box.textContent = 'The AI is warming up. Give it a moment and try again!';
       }
       btn.disabled = false;
       btn.textContent = 'Tell me another joke';
@@ -277,7 +282,7 @@ HTML = """
         await fetch('/api/share/' + currentJokeId, {method: 'POST'});
       } catch (e) { /* best effort */ }
       const permalink = '{{ site_url }}/joke/' + currentJokeId;
-      const text = currentJokeText + String.fromCharCode(10,10) + 'via @bitsecai x @basilic_ai';
+      const text = currentJokeText;
       const intentUrl = 'https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink);
       window.open(intentUrl, '_blank');
       shareBtn.disabled = false;
@@ -311,6 +316,15 @@ def save_joke(joke: str, factoid: str, technique: str) -> str:
 
 @app.route("/api/joke")
 def api_joke():
+    try:
+        llm = _get_llm()
+    except RuntimeError as e:
+        return jsonify(joke="No AI model is running right now. Try again in a few minutes!", error=str(e)), 503
+
+    joke = ""
+    factoid = ""
+    technique = ""
+
     for attempt in range(MAX_RETRIES):
         # 1. Pick a random factoid as the topic
         factoid = random.choice(FACTOIDS)
@@ -333,16 +347,24 @@ def api_joke():
 
         user_prompt = f"Write a roast joke using this fact: {factoid}"
 
-        response = _get_llm().chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.9,
-            top_p=0.95,
-            max_tokens=150,
-        )
+        try:
+            response = llm.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.9,
+                top_p=0.95,
+                max_tokens=150,
+            )
+        except Exception as e:
+            # LLM call failed — reset cached client so next request retries
+            global _llm
+            _llm = None
+            print(f"LLM inference error: {e}")
+            return jsonify(joke="The AI is having a moment. Try again!", error=str(e)), 502
+
         joke = _clean_joke(response.choices[0].message.content)
 
         if not joke or len(joke) < 20:
@@ -350,6 +372,9 @@ def api_joke():
         if not _is_duplicate(joke):
             break  # original enough — use it
     # else: use the last attempt even if it's a dupe (better than nothing)
+
+    if not joke or len(joke) < 20:
+        return jsonify(joke="The AI drew a blank. Hit the button again!", error="empty_response"), 200
 
     joke_id = save_joke(joke, factoid, technique)
     resp = jsonify(joke=joke, id=joke_id)
@@ -517,7 +542,7 @@ JOKE_PAGE_HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-4B</p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-0.6B</p>
     <div class="joke-text">{{ joke }}</div>
     <div class="joke-meta">
       <span>{{ style }}</span>
@@ -538,7 +563,7 @@ JOKE_PAGE_HTML = """
       e.preventDefault();
       var jokeText = document.querySelector('.joke-text').textContent;
       var permalink = '{{ site_url }}/joke/{{ joke_id }}';
-      var text = jokeText + String.fromCharCode(10,10) + 'via @bitsecai x @basilic_ai';
+      var text = jokeText;
       window.open('https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink), '_blank');
     }
   </script>
@@ -742,7 +767,7 @@ ALL_JOKES_HTML = """
         await fetch('/api/share/' + jokeId, {method: 'POST'});
       } catch (err) { /* best effort */ }
       const permalink = '{{ site_url }}/joke/' + jokeId;
-      const text = jokeText + String.fromCharCode(10,10) + 'via @bitsecai x @basilic_ai';
+      const text = jokeText;
       window.open('https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink), '_blank');
       el.textContent = 'Share on X';
     }
