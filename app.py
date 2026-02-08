@@ -17,6 +17,7 @@ import random
 import re
 import textwrap
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 import requests as http_requests
 from dotenv import load_dotenv
@@ -33,7 +34,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Connect to existing deployment, or deploy a new one
 # ---------------------------------------------------------------------------
-MODEL = "Qwen/Qwen3-0.6B"
+MODEL = "Qwen/Qwen3-4B"
 
 _llm = None
 
@@ -95,6 +96,35 @@ JOKES_DIR.mkdir(exist_ok=True)
 GITHUB_REPO = "Bitsec-AI/jokes"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 SITE_URL = "https://bittensor-roast.fly.dev"
+
+# Flat set of all example jokes (for deduplication)
+ALL_EXAMPLES: set[str] = {joke for jokes in EXAMPLES.values() for joke in jokes}
+
+# Similarity threshold — anything above this vs examples or recent jokes triggers retry
+DEDUP_THRESHOLD = 0.6
+MAX_RETRIES = 3
+
+
+def _clean_joke(raw: str) -> str:
+    """Strip <think> tags (including unclosed ones) from model output."""
+    text = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip().strip('"').strip()
+
+
+def _is_duplicate(joke: str) -> bool:
+    """Check if joke is too similar to an example or a recently generated joke."""
+    joke_lower = joke.lower()
+    # Check against all few-shot examples
+    for ex in ALL_EXAMPLES:
+        if SequenceMatcher(None, joke_lower, ex.lower()).ratio() > DEDUP_THRESHOLD:
+            return True
+    # Check against recently saved jokes (last 50)
+    recent = _get_jokes()[:50]
+    for prev in recent:
+        if SequenceMatcher(None, joke_lower, prev["joke"].lower()).ratio() > DEDUP_THRESHOLD:
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # In-memory joke index (avoids re-parsing all files on every request)
@@ -197,7 +227,7 @@ HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-0.6B</p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-4B</p>
     <div id="joke" class="empty">Click the button to get roasted, subnet owner.</div>
     <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
       <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
@@ -281,37 +311,50 @@ def save_joke(joke: str, factoid: str, technique: str) -> str:
 
 @app.route("/api/joke")
 def api_joke():
-    # 1. Pick a random factoid as the topic
-    factoid = random.choice(FACTOIDS)
+    for attempt in range(MAX_RETRIES):
+        # 1. Pick a random factoid as the topic
+        factoid = random.choice(FACTOIDS)
 
-    # 2. Pick a random comedy technique and sample few-shot examples
-    technique = random.choice(TECHNIQUES)
-    examples = random.sample(EXAMPLES[technique], min(3, len(EXAMPLES[technique])))
-    examples_block = "\n".join(f"- {ex}" for ex in examples)
+        # 2. Pick a random comedy technique and ONE example
+        technique = random.choice(TECHNIQUES)
+        example = random.choice(EXAMPLES[technique])
 
-    system_prompt = (
-        f"You write short roast jokes about the Bittensor (TAO) crypto ecosystem.\n\n"
-        f"Your comedy style: {technique}\n\n"
-        f"Examples of this style:\n{examples_block}\n\n"
-        f"Write ONE new joke in the same style. Just the joke, nothing else.\n\n"
-        f"/no_think"
-    )
+        system_prompt = (
+            f"You write short, original roast jokes about the Bittensor (TAO) crypto ecosystem.\n\n"
+            f"Your comedy style: {technique}\n\n"
+            f"Here is one example of the style (DO NOT copy or paraphrase this — write something completely new):\n"
+            f"- {example}\n\n"
+            f"Rules:\n"
+            f"- Write ONE new joke. Just the joke text, nothing else.\n"
+            f"- Your joke MUST be original. Do NOT reuse phrases or structure from the example.\n"
+            f"- Use the factoid below as inspiration, but transform it into humor — don't just restate it.\n\n"
+            f"/no_think"
+        )
 
-    user_prompt = f"Write a roast joke using this fact: {factoid}"
+        user_prompt = f"Write a roast joke using this fact: {factoid}"
 
-    response = _get_llm().chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.7,
-        top_p=0.8,
-        max_tokens=150,
-    )
-    joke = re.sub(r"<think>.*?</think>\s*", "", response.choices[0].message.content, flags=re.DOTALL).strip()
+        response = _get_llm().chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.9,
+            top_p=0.95,
+            max_tokens=150,
+        )
+        joke = _clean_joke(response.choices[0].message.content)
+
+        if not joke or len(joke) < 20:
+            continue  # too short / empty — retry
+        if not _is_duplicate(joke):
+            break  # original enough — use it
+    # else: use the last attempt even if it's a dupe (better than nothing)
+
     joke_id = save_joke(joke, factoid, technique)
-    return jsonify(joke=joke, id=joke_id)
+    resp = jsonify(joke=joke, id=joke_id)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +517,7 @@ JOKE_PAGE_HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-0.6B</p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">bitsecai</a> &middot; Powered by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a> + Qwen/Qwen3-4B</p>
     <div class="joke-text">{{ joke }}</div>
     <div class="joke-meta">
       <span>{{ style }}</span>
