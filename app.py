@@ -30,25 +30,27 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 MODEL = "Qwen/Qwen3-0.6B"
 
-client = BasilicaClient()
+_llm = None
 
-# Reuse an existing active deployment if available
-deployment = None
-for d in client.list_deployments().deployments:
-    if d.state == "Active":
-        deployment = client.get(d.instance_name)
-        print(f"Reusing existing deployment: {deployment.url}")
-        break
 
-if deployment is None:
-    print(f"Deploying {MODEL} … (this may take a few minutes on first run)")
-    deployment = client.deploy_vllm(model=MODEL, name="joke-generator")
-    print(f"Model ready at {deployment.url}")
-
-# ---------------------------------------------------------------------------
-# OpenAI-compatible client pointed at the deployment
-# ---------------------------------------------------------------------------
-llm = OpenAI(base_url=f"{deployment.url}/v1", api_key="not-needed")
+def _get_llm():
+    """Lazy-init Basilica connection on first /api/joke request."""
+    global _llm
+    if _llm is not None:
+        return _llm
+    client = BasilicaClient()
+    deployment = None
+    for d in client.list_deployments().deployments:
+        if d.state == "Active":
+            deployment = client.get(d.instance_name)
+            print(f"Reusing existing deployment: {deployment.url}")
+            break
+    if deployment is None:
+        print(f"Deploying {MODEL} … (this may take a few minutes)")
+        deployment = client.deploy_vllm(model=MODEL, name="joke-generator", ttl_seconds=3600)
+        print(f"Model ready at {deployment.url}")
+    _llm = OpenAI(base_url=f"{deployment.url}/v1", api_key="not-needed")
+    return _llm
 
 # ---------------------------------------------------------------------------
 # Load factoids and example jokes
@@ -185,12 +187,13 @@ HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Powered by Basilica + {{ model }}</p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">BitSec</a> &middot; Inference by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a></p>
     <div id="joke" class="empty">Click the button to get roasted, subnet owner.</div>
     <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
     <p class="footer">
       <a href="/all-jokes" style="color:#6c3ce0;text-decoration:none;">View all roasts</a>
-      &middot; Running on Basilica vLLM inference &middot; TAO bless
+      &middot; <a href="https://github.com/Bitsec-AI/jokes" style="color:#6c3ce0;text-decoration:none;">GitHub</a>
+      &middot; TAO bless
     </p>
   </div>
   <script>
@@ -258,7 +261,7 @@ def api_joke():
 
     user_prompt = f"Write a roast joke using this fact: {factoid}"
 
-    response = llm.chat.completions.create(
+    response = _get_llm().chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -420,5 +423,6 @@ def all_jokes():
 
 
 if __name__ == "__main__":
-    print("\n  Open http://localhost:8080 in your browser\n")
-    app.run(host="127.0.0.1", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    print(f"\n  Open http://localhost:{port} in your browser\n")
+    app.run(host="0.0.0.0", port=port)
