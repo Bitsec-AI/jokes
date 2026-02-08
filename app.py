@@ -612,7 +612,6 @@ def _render_joke_image(joke_text: str) -> bytes:
     font_title = ImageFont.load_default(size=42)
     font_body = ImageFont.load_default(size=34)
     font_quote = ImageFont.load_default(size=120)
-    font_footer = ImageFont.load_default(size=22)
 
     # Big decorative quote mark in orange
     draw.text((60, 80), "\u201c", fill="#f57c2060", font=font_quote)
@@ -628,14 +627,6 @@ def _render_joke_image(joke_text: str) -> bytes:
     text_h = bbox[3] - bbox[1]
     y_start = max(140, (H - text_h) / 2 - 10)
     draw.text((120, y_start), wrapped, fill="white", font=font_body)
-
-    # Divider line above footer
-    draw.line([(100, H - 80), (W - 100, H - 80)], fill="#333333", width=1)
-
-    # Footer
-    footer = "@bitsecai  x  @basilic_ai"
-    bbox = draw.textbbox((0, 0), footer, font=font_footer)
-    draw.text(((W - bbox[2]) / 2, H - 55), footer, fill="#999999", font=font_footer)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
