@@ -2,4 +2,6 @@ basilica-sdk==0.17.0
 Flask==3.1.2
 gunicorn==23.0.0
 openai==2.17.0
+Pillow==11.1.0
 python-dotenv==1.1.0
+requests==2.32.3

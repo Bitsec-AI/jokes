@@ -9,15 +9,19 @@ Usage:
 Or set BASILICA_API_TOKEN as an environment variable.
 """
 
+import base64
+import io
 import os
 import random
 import re
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
-
+import requests as http_requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, abort, jsonify, render_template_string, request
 from openai import OpenAI
+from PIL import Image, ImageDraw, ImageFont
 from basilica import BasilicaClient
 
 # ---------------------------------------------------------------------------
@@ -86,6 +90,10 @@ EXAMPLES = load_examples(BASE_DIR / "examples.md")
 TECHNIQUES = list(EXAMPLES.keys())
 JOKES_DIR = BASE_DIR / "all-jokes"
 JOKES_DIR.mkdir(exist_ok=True)
+
+GITHUB_REPO = "Bitsec-AI/jokes"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+SITE_URL = "https://bittensor-roast.fly.dev"
 
 # ---------------------------------------------------------------------------
 # In-memory joke index (avoids re-parsing all files on every request)
@@ -187,9 +195,12 @@ HTML = """
 <body>
   <div class="card">
     <h1>Bittensor Roast Machine</h1>
-    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">BitSec</a> &middot; Inference by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a></p>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">BitSec</a> &middot; Qwen3-0.6B Inference by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a></p>
     <div id="joke" class="empty">Click the button to get roasted, subnet owner.</div>
-    <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+      <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
+      <button id="share-btn" onclick="shareJoke()" style="display:none;background:linear-gradient(135deg,#1da1f2,#0d8ecf);">Share on X</button>
+    </div>
     <p class="footer">
       <a href="/all-jokes" style="color:#6c3ce0;text-decoration:none;">View all roasts</a>
       &middot; <a href="https://github.com/Bitsec-AI/jokes" style="color:#6c3ce0;text-decoration:none;">GitHub</a>
@@ -197,11 +208,16 @@ HTML = """
     </p>
   </div>
   <script>
+    let currentJokeId = null;
+    let currentJokeText = null;
+
     async function getJoke() {
       const btn = document.getElementById('btn');
       const box = document.getElementById('joke');
+      const shareBtn = document.getElementById('share-btn');
       btn.disabled = true;
       btn.textContent = 'Thinking…';
+      shareBtn.style.display = 'none';
       box.className = 'empty';
       box.textContent = '...';
       try {
@@ -209,12 +225,31 @@ HTML = """
         const data = await res.json();
         box.className = '';
         box.textContent = data.joke;
+        currentJokeId = data.id;
+        currentJokeText = data.joke;
+        shareBtn.style.display = 'inline-block';
       } catch (err) {
         box.className = '';
         box.textContent = 'Oops, something went wrong. Try again!';
       }
       btn.disabled = false;
       btn.textContent = 'Tell me another joke';
+    }
+
+    async function shareJoke() {
+      if (!currentJokeId) return;
+      const shareBtn = document.getElementById('share-btn');
+      shareBtn.disabled = true;
+      shareBtn.textContent = 'Saving…';
+      try {
+        await fetch('/api/share/' + currentJokeId, {method: 'POST'});
+      } catch (e) { /* best effort */ }
+      const permalink = '{{ site_url }}/joke/' + currentJokeId;
+      const text = currentJokeText + '\n\nvia @bitsecai x @basilic_ai';
+      const intentUrl = 'https://x.com/intent/tweet?text=' + encodeURIComponent(text) + '&url=' + encodeURIComponent(permalink);
+      window.open(intentUrl, '_blank');
+      shareBtn.disabled = false;
+      shareBtn.textContent = 'Share on X';
     }
   </script>
 </body>
@@ -224,11 +259,11 @@ HTML = """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, model=MODEL)
+    return render_template_string(HTML, model=MODEL, site_url=SITE_URL)
 
 
-def save_joke(joke: str, factoid: str, technique: str) -> None:
-    """Save a generated joke as a markdown file in all-jokes/."""
+def save_joke(joke: str, factoid: str, technique: str) -> str:
+    """Save a generated joke as a markdown file in all-jokes/. Returns the filename stem (joke ID)."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     slug = re.sub(r"[^a-z0-9]+", "-", joke[:40].lower()).strip("-")
     filename = f"{ts}-{slug}.md"
@@ -239,6 +274,7 @@ def save_joke(joke: str, factoid: str, technique: str) -> None:
         f"**Factoid:** {factoid}\n"
     )
     (JOKES_DIR / filename).write_text(content)
+    return Path(filename).stem
 
 
 @app.route("/api/joke")
@@ -272,8 +308,226 @@ def api_joke():
         max_tokens=150,
     )
     joke = re.sub(r"<think>.*?</think>\s*", "", response.choices[0].message.content, flags=re.DOTALL).strip()
-    save_joke(joke, factoid, technique)
-    return jsonify(joke=joke)
+    joke_id = save_joke(joke, factoid, technique)
+    return jsonify(joke=joke, id=joke_id)
+
+
+# ---------------------------------------------------------------------------
+# Joke loading helper (local filesystem + GitHub API fallback)
+# ---------------------------------------------------------------------------
+
+def _load_joke(joke_id: str) -> dict | None:
+    """Find a joke by ID. Checks local files first, falls back to GitHub API."""
+    # Local: glob for files starting with the ID
+    matches = list(JOKES_DIR.glob(f"{joke_id}*.md"))
+    if matches:
+        return _parse_joke_file(matches[0])
+
+    # Fallback: fetch from GitHub API
+    if not GITHUB_TOKEN:
+        return None
+    # Try exact filename (ID + .md)
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/all-jokes/{joke_id}.md"
+    resp = http_requests.get(url, headers={
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }, timeout=10)
+    if resp.status_code != 200:
+        return None
+    content = base64.b64decode(resp.json()["content"]).decode()
+    joke_match = re.search(r"^> (.+)$", content, re.MULTILINE)
+    style_match = re.search(r"\*\*Style:\*\* (.+)", content)
+    ts_match = re.match(r"(\d{8})-(\d{6})", joke_id)
+    time_str = ""
+    if ts_match:
+        d, t = ts_match.groups()
+        time_str = f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]} UTC"
+    return {
+        "joke": joke_match.group(1).strip() if joke_match else "(parse error)",
+        "style": style_match.group(1).strip() if style_match else "",
+        "time": time_str,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Share endpoint: commit joke file to GitHub
+# ---------------------------------------------------------------------------
+
+@app.route("/api/share/<joke_id>", methods=["POST"])
+def api_share(joke_id: str):
+    if not GITHUB_TOKEN:
+        return jsonify(ok=False, error="GITHUB_TOKEN not configured"), 500
+
+    # Find the local file
+    matches = list(JOKES_DIR.glob(f"{joke_id}*.md"))
+    if not matches:
+        return jsonify(ok=False, error="Joke not found"), 404
+
+    filepath = matches[0]
+    content_b64 = base64.b64encode(filepath.read_bytes()).decode()
+
+    # PUT to GitHub Contents API
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/all-jokes/{filepath.name}"
+    resp = http_requests.put(url, headers={
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }, json={
+        "message": f"Add joke {filepath.name}",
+        "content": content_b64,
+    }, timeout=15)
+
+    if resp.status_code in (200, 201):
+        return jsonify(ok=True, url=f"{SITE_URL}/joke/{joke_id}")
+    if resp.status_code == 422:
+        # Already exists — that's fine
+        return jsonify(ok=True, url=f"{SITE_URL}/joke/{joke_id}")
+    return jsonify(ok=False, error=f"GitHub API error {resp.status_code}"), 502
+
+
+# ---------------------------------------------------------------------------
+# Permalink page with OG meta tags
+# ---------------------------------------------------------------------------
+
+JOKE_PAGE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bittensor Roast</title>
+  <meta property="og:title" content="Bittensor Roast Machine">
+  <meta property="og:description" content="{{ joke }}">
+  <meta property="og:image" content="{{ site_url }}/joke/{{ joke_id }}/image">
+  <meta property="og:url" content="{{ site_url }}/joke/{{ joke_id }}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Bittensor Roast Machine">
+  <meta name="twitter:description" content="{{ joke }}">
+  <meta name="twitter:image" content="{{ site_url }}/joke/{{ joke_id }}/image">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: #1a1a2e;
+      border: 1px solid #2a2a4a;
+      border-radius: 16px;
+      padding: 48px;
+      max-width: 600px;
+      width: 90%;
+      text-align: center;
+    }
+    h1 { font-size: 2rem; margin-bottom: 8px; }
+    .subtitle { color: #888; margin-bottom: 32px; font-size: 0.9rem; }
+    .joke-text {
+      background: #12121f;
+      border: 1px solid #2a2a4a;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 16px;
+      font-size: 1.1rem;
+      line-height: 1.6;
+    }
+    .joke-meta { color: #555; font-size: 0.75rem; margin-bottom: 24px; }
+    .joke-meta span { margin-right: 16px; }
+    a.btn {
+      display: inline-block;
+      background: linear-gradient(135deg, #6c3ce0, #4a7cf7);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 14px 32px;
+      font-size: 1rem;
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.2s;
+    }
+    a.btn:hover { opacity: 0.85; }
+    .footer { margin-top: 24px; color: #555; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Bittensor Roast Machine</h1>
+    <p class="subtitle">Built by <a href="https://x.com/bitsecai" style="color:#6c3ce0;text-decoration:none;">BitSec</a> &middot; Qwen3-0.6B Inference by <a href="https://x.com/basilic_ai" style="color:#6c3ce0;text-decoration:none;">Basilica</a></p>
+    <div class="joke-text">{{ joke }}</div>
+    <div class="joke-meta">
+      <span>{{ style }}</span>
+      <span>{{ time }}</span>
+    </div>
+    <a class="btn" href="/">Get roasted</a>
+    <p class="footer">
+      <a href="/all-jokes" style="color:#6c3ce0;text-decoration:none;">View all roasts</a>
+      &middot; <a href="https://github.com/Bitsec-AI/jokes" style="color:#6c3ce0;text-decoration:none;">GitHub</a>
+      &middot; TAO bless
+    </p>
+  </div>
+</body>
+</html>
+"""
+
+
+@app.route("/joke/<joke_id>")
+def joke_permalink(joke_id: str):
+    data = _load_joke(joke_id)
+    if not data:
+        abort(404)
+    return render_template_string(
+        JOKE_PAGE_HTML,
+        joke=data["joke"],
+        style=data["style"],
+        time=data["time"],
+        joke_id=joke_id,
+        site_url=SITE_URL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OG image generation (Pillow)
+# ---------------------------------------------------------------------------
+
+@app.route("/joke/<joke_id>/image")
+def joke_image(joke_id: str):
+    data = _load_joke(joke_id)
+    if not data:
+        abort(404)
+
+    W, H = 1200, 630
+    img = Image.new("RGB", (W, H), "#0f0f1a")
+    draw = ImageDraw.Draw(img)
+
+    font_title = ImageFont.load_default(size=48)
+    font_body = ImageFont.load_default(size=36)
+    font_footer = ImageFont.load_default(size=24)
+
+    # Title
+    title = "Bittensor Roast Machine"
+    bbox = draw.textbbox((0, 0), title, font=font_title)
+    draw.text(((W - bbox[2]) / 2, 40), title, fill="#e0e0e0", font=font_title)
+
+    # Joke text — word-wrapped
+    joke_text = data["joke"]
+    wrapped = textwrap.fill(joke_text, width=45)
+    bbox = draw.textbbox((0, 0), wrapped, font=font_body)
+    text_h = bbox[3] - bbox[1]
+    y_start = (H - text_h) / 2
+    draw.text((80, y_start), wrapped, fill="white", font=font_body)
+
+    # Footer
+    footer = "@bitsecai x @basilic_ai"
+    bbox = draw.textbbox((0, 0), footer, font=font_footer)
+    draw.text(((W - bbox[2]) / 2, H - 60), footer, fill="#555555", font=font_footer)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return Response(buf.getvalue(), mimetype="image/png")
 
 
 ALL_JOKES_HTML = """
