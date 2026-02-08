@@ -16,6 +16,7 @@ import os
 import random
 import re
 import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -100,6 +101,62 @@ GITHUB_REPO = "Bitsec-AI/jokes"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 SITE_URL = "https://bittensor-roast.fly.dev"
 
+_GITHUB_HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json",
+} if GITHUB_TOKEN else {}
+
+_github_synced = False
+
+
+def _sync_from_github():
+    """One-time sync: download all joke files from GitHub to local filesystem."""
+    global _github_synced
+    if _github_synced or not GITHUB_TOKEN:
+        return
+    _github_synced = True
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/all-jokes"
+        resp = http_requests.get(url, headers=_GITHUB_HEADERS, timeout=15)
+        if resp.status_code != 200:
+            print(f"GitHub sync: listing failed ({resp.status_code})")
+            return
+        local_names = {f.name for f in JOKES_DIR.glob("*.md")}
+        to_fetch = [f for f in resp.json()
+                     if f["name"].endswith(".md") and f["name"] not in local_names]
+        if not to_fetch:
+            return
+
+        def _download(f):
+            try:
+                r = http_requests.get(f["url"], headers=_GITHUB_HEADERS, timeout=10)
+                if r.status_code == 200:
+                    content = base64.b64decode(r.json()["content"]).decode()
+                    (JOKES_DIR / f["name"]).write_text(content)
+            except Exception:
+                pass
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            list(pool.map(_download, to_fetch))
+        print(f"GitHub sync: downloaded {len(to_fetch)} jokes")
+    except Exception as e:
+        print(f"GitHub sync error: {e}")
+
+
+def _push_to_github(filename: str, content: str):
+    """Push a joke file to GitHub (best-effort)."""
+    if not GITHUB_TOKEN:
+        return
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/all-jokes/{filename}"
+        http_requests.put(url, headers=_GITHUB_HEADERS, json={
+            "message": f"Add joke {filename}",
+            "content": base64.b64encode(content.encode()).decode(),
+        }, timeout=15)
+    except Exception as e:
+        print(f"GitHub push failed for {filename}: {e}")
+
+
 # Flat set of all example jokes (for deduplication)
 ALL_EXAMPLES: set[str] = {joke for jokes in EXAMPLES.values() for joke in jokes}
 
@@ -156,6 +213,7 @@ def _parse_joke_file(f: Path) -> dict:
 
 def _get_jokes() -> list[dict]:
     global _joke_cache, _joke_cache_count
+    _sync_from_github()
     files = sorted(JOKES_DIR.glob("*.md"), reverse=True)
     if len(files) != _joke_cache_count:
         _joke_cache = [_parse_joke_file(f) for f in files]
