@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+Basilica Joke Generator — deploys a vLLM model and serves jokes on a webpage.
+
+Usage:
+    export BASILICA_API_TOKEN="basilica_..."
+    python app.py
+
+Or reads the token from basilica_api_token.json automatically.
+"""
+
+import json
+import os
+import random
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template_string
+from openai import OpenAI
+from basilica import BasilicaClient
+
+# ---------------------------------------------------------------------------
+# Auth: load API token from env or local JSON file
+# ---------------------------------------------------------------------------
+TOKEN_FILE = Path(__file__).parent / "basilica_api_token.json"
+
+if not os.environ.get("BASILICA_API_TOKEN") and TOKEN_FILE.exists():
+    token_data = json.loads(TOKEN_FILE.read_text())
+    os.environ["BASILICA_API_TOKEN"] = token_data["token"]
+
+# ---------------------------------------------------------------------------
+# Connect to existing deployment, or deploy a new one
+# ---------------------------------------------------------------------------
+MODEL = "Qwen/Qwen3-0.6B"
+
+client = BasilicaClient()
+
+# Reuse an existing active deployment if available
+deployment = None
+for d in client.list_deployments().deployments:
+    if d.state == "Active":
+        deployment = client.get(d.instance_name)
+        print(f"Reusing existing deployment: {deployment.url}")
+        break
+
+if deployment is None:
+    print(f"Deploying {MODEL} … (this may take a few minutes on first run)")
+    deployment = client.deploy_vllm(model=MODEL, name="joke-generator")
+    print(f"Model ready at {deployment.url}")
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible client pointed at the deployment
+# ---------------------------------------------------------------------------
+llm = OpenAI(base_url=f"{deployment.url}/v1", api_key="not-needed")
+
+# ---------------------------------------------------------------------------
+# Load factoids and example jokes
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+
+
+def load_factoids(path: Path) -> list[str]:
+    """Parse factoids.md — extract numbered items (e.g. '1. ...')."""
+    items = []
+    for line in path.read_text().splitlines():
+        m = re.match(r"^\d+\.\s+(.+)", line)
+        if m:
+            items.append(m.group(1).strip())
+    return items
+
+
+def load_examples(path: Path) -> dict[str, list[str]]:
+    """Parse examples.md into {technique_name: [joke, ...]}."""
+    sections: dict[str, list[str]] = {}
+    current_section = None
+    for line in path.read_text().splitlines():
+        if line.startswith("## "):
+            current_section = line.removeprefix("## ").strip()
+            sections[current_section] = []
+        elif current_section and line.startswith("- "):
+            sections[current_section].append(line.removeprefix("- ").strip())
+    return {k: v for k, v in sections.items() if v}
+
+
+FACTOIDS = load_factoids(BASE_DIR / "factoids.md")
+EXAMPLES = load_examples(BASE_DIR / "examples.md")
+TECHNIQUES = list(EXAMPLES.keys())
+JOKES_DIR = BASE_DIR / "all-jokes"
+JOKES_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
+app = Flask(__name__)
+
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Basilica Joke Generator</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: #1a1a2e;
+      border: 1px solid #2a2a4a;
+      border-radius: 16px;
+      padding: 48px;
+      max-width: 600px;
+      width: 90%;
+      text-align: center;
+    }
+    h1 { font-size: 2rem; margin-bottom: 8px; }
+    .subtitle { color: #888; margin-bottom: 32px; font-size: 0.9rem; }
+    #joke {
+      background: #12121f;
+      border: 1px solid #2a2a4a;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+      min-height: 80px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+    #joke.empty { color: #555; font-style: italic; }
+    button {
+      background: linear-gradient(135deg, #6c3ce0, #4a7cf7);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 14px 32px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .footer { margin-top: 24px; color: #555; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Bittensor Roast Machine</h1>
+    <p class="subtitle">Powered by Basilica + {{ model }}</p>
+    <div id="joke" class="empty">Click the button to get roasted, subnet owner.</div>
+    <button id="btn" onclick="getJoke()">Roast a subnet owner</button>
+    <p class="footer">
+      <a href="/all-jokes" style="color:#6c3ce0;text-decoration:none;">View all roasts</a>
+      &middot; Running on Basilica vLLM inference &middot; TAO bless
+    </p>
+  </div>
+  <script>
+    async function getJoke() {
+      const btn = document.getElementById('btn');
+      const box = document.getElementById('joke');
+      btn.disabled = true;
+      btn.textContent = 'Thinking…';
+      box.className = 'empty';
+      box.textContent = '...';
+      try {
+        const res = await fetch('/api/joke');
+        const data = await res.json();
+        box.className = '';
+        box.textContent = data.joke;
+      } catch (err) {
+        box.className = '';
+        box.textContent = 'Oops, something went wrong. Try again!';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Tell me another joke';
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(HTML, model=MODEL)
+
+
+def save_joke(joke: str, factoid: str, technique: str) -> None:
+    """Save a generated joke as a markdown file in all-jokes/."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    slug = re.sub(r"[^a-z0-9]+", "-", joke[:40].lower()).strip("-")
+    filename = f"{ts}-{slug}.md"
+    content = (
+        f"# Roast\n\n"
+        f"> {joke}\n\n"
+        f"**Style:** {technique}  \n"
+        f"**Factoid:** {factoid}\n"
+    )
+    (JOKES_DIR / filename).write_text(content)
+
+
+@app.route("/api/joke")
+def api_joke():
+    # 1. Pick a random factoid as the topic
+    factoid = random.choice(FACTOIDS)
+
+    # 2. Pick a random comedy technique and sample few-shot examples
+    technique = random.choice(TECHNIQUES)
+    examples = random.sample(EXAMPLES[technique], min(3, len(EXAMPLES[technique])))
+    examples_block = "\n".join(f"- {ex}" for ex in examples)
+
+    system_prompt = (
+        f"You write short roast jokes about the Bittensor (TAO) crypto ecosystem.\n\n"
+        f"Your comedy style: {technique}\n\n"
+        f"Examples of this style:\n{examples_block}\n\n"
+        f"Write ONE new joke in the same style. Just the joke, nothing else.\n\n"
+        f"/no_think"
+    )
+
+    user_prompt = f"Write a roast joke using this fact: {factoid}"
+
+    response = llm.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.7,
+        top_p=0.8,
+        max_tokens=150,
+    )
+    joke = response.choices[0].message.content.strip()
+    save_joke(joke, factoid, technique)
+    return jsonify(joke=joke)
+
+
+ALL_JOKES_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>All Roasts</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 48px 24px;
+    }
+    .container { max-width: 700px; margin: 0 auto; }
+    h1 { font-size: 2rem; margin-bottom: 8px; text-align: center; }
+    .subtitle { color: #888; margin-bottom: 32px; font-size: 0.9rem; text-align: center; }
+    .joke-card {
+      background: #1a1a2e;
+      border: 1px solid #2a2a4a;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 16px;
+    }
+    .joke-text { font-size: 1.05rem; line-height: 1.6; margin-bottom: 12px; }
+    .joke-meta { color: #555; font-size: 0.75rem; }
+    .joke-meta span { margin-right: 16px; }
+    a { color: #6c3ce0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .back { text-align: center; margin-bottom: 24px; }
+    .empty-state { text-align: center; color: #555; padding: 48px; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>All Roasts</h1>
+    <p class="subtitle">{{ count }} roast{{ 's' if count != 1 else '' }} generated</p>
+    <p class="back"><a href="/">&larr; Back to roast machine</a></p>
+    {% if jokes %}
+      {% for j in jokes %}
+      <div class="joke-card">
+        <div class="joke-text">{{ j.joke }}</div>
+        <div class="joke-meta">
+          <span>{{ j.style }}</span>
+          <span>{{ j.time }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state">No roasts yet. Go generate some!</div>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
+
+@app.route("/all-jokes")
+def all_jokes():
+    jokes = []
+    for f in sorted(JOKES_DIR.glob("*.md"), reverse=True):
+        text = f.read_text()
+        # Extract joke from "> ..." blockquote line
+        joke_match = re.search(r"^> (.+)$", text, re.MULTILINE)
+        style_match = re.search(r"\*\*Style:\*\* (.+)", text)
+        # Parse timestamp from filename: YYYYMMDD-HHMMSS-...
+        ts_match = re.match(r"(\d{8})-(\d{6})", f.name)
+        time_str = ""
+        if ts_match:
+            d, t = ts_match.groups()
+            time_str = f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]} UTC"
+        jokes.append({
+            "joke": joke_match.group(1) if joke_match else "(parse error)",
+            "style": style_match.group(1).strip() if style_match else "",
+            "time": time_str,
+        })
+    return render_template_string(ALL_JOKES_HTML, jokes=jokes, count=len(jokes))
+
+
+if __name__ == "__main__":
+    print("\n  Open http://localhost:8080 in your browser\n")
+    app.run(host="127.0.0.1", port=8080)
