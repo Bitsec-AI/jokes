@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from openai import OpenAI
 from basilica import BasilicaClient
 
@@ -84,6 +84,39 @@ EXAMPLES = load_examples(BASE_DIR / "examples.md")
 TECHNIQUES = list(EXAMPLES.keys())
 JOKES_DIR = BASE_DIR / "all-jokes"
 JOKES_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# In-memory joke index (avoids re-parsing all files on every request)
+# ---------------------------------------------------------------------------
+_joke_cache: list[dict] = []
+_joke_cache_count: int = -1  # force initial load
+JOKES_PER_PAGE = 20
+
+
+def _parse_joke_file(f: Path) -> dict:
+    text = f.read_text()
+    joke_match = re.search(r"^> (.+)$", text, re.MULTILINE)
+    style_match = re.search(r"\*\*Style:\*\* (.+)", text)
+    ts_match = re.match(r"(\d{8})-(\d{6})", f.name)
+    time_str = ""
+    if ts_match:
+        d, t = ts_match.groups()
+        time_str = f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]} UTC"
+    return {
+        "joke": joke_match.group(1).strip() if joke_match else "(parse error)",
+        "style": style_match.group(1).strip() if style_match else "",
+        "time": time_str,
+    }
+
+
+def _get_jokes() -> list[dict]:
+    global _joke_cache, _joke_cache_count
+    files = sorted(JOKES_DIR.glob("*.md"), reverse=True)
+    if len(files) != _joke_cache_count:
+        _joke_cache = [_parse_joke_file(f) for f in files]
+        _joke_cache_count = len(files)
+    return _joke_cache
+
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -235,7 +268,7 @@ def api_joke():
         top_p=0.8,
         max_tokens=150,
     )
-    joke = response.choices[0].message.content.strip()
+    joke = re.sub(r"<think>.*?</think>\s*", "", response.choices[0].message.content, flags=re.DOTALL).strip()
     save_joke(joke, factoid, technique)
     return jsonify(joke=joke)
 
@@ -273,13 +306,48 @@ ALL_JOKES_HTML = """
     a:hover { text-decoration: underline; }
     .back { text-align: center; margin-bottom: 24px; }
     .empty-state { text-align: center; color: #555; padding: 48px; font-style: italic; }
+    .filters { text-align: center; margin-bottom: 24px; line-height: 2; }
+    .filter-label { color: #888; margin-right: 8px; font-size: 0.85rem; }
+    .filters a {
+      display: inline-block; padding: 4px 12px; margin: 2px 4px;
+      border-radius: 6px; font-size: 0.8rem; border: 1px solid #2a2a4a;
+      color: #aaa; transition: all 0.15s;
+    }
+    .filters a:hover { border-color: #6c3ce0; color: #e0e0e0; text-decoration: none; }
+    .filters a.active { background: #6c3ce0; border-color: #6c3ce0; color: white; }
+    .pagination {
+      display: flex; justify-content: center; align-items: center;
+      gap: 24px; margin-top: 24px; padding: 16px 0;
+    }
+    .pagination a {
+      padding: 8px 16px; border: 1px solid #2a2a4a;
+      border-radius: 8px; font-size: 0.85rem; transition: border-color 0.15s;
+    }
+    .pagination a:hover { border-color: #6c3ce0; text-decoration: none; }
+    .pagination .disabled { color: #333; padding: 8px 16px; font-size: 0.85rem; }
+    .page-info { color: #888; font-size: 0.85rem; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>All Roasts</h1>
-    <p class="subtitle">{{ count }} roast{{ 's' if count != 1 else '' }} generated</p>
+    <p class="subtitle">
+      {% if style_filter %}
+        {{ count }} {{ style_filter }} roast{{ 's' if count != 1 else '' }}
+        (of {{ total_all }} total)
+      {% else %}
+        {{ count }} roast{{ 's' if count != 1 else '' }} generated
+      {% endif %}
+    </p>
     <p class="back"><a href="/">&larr; Back to roast machine</a></p>
+    <div class="filters">
+      <span class="filter-label">Filter:</span>
+      <a href="/all-jokes" class="{{ 'active' if not style_filter else '' }}">All</a>
+      {% for tech in techniques %}
+        <a href="/all-jokes?style={{ tech }}"
+           class="{{ 'active' if style_filter == tech else '' }}">{{ tech }}</a>
+      {% endfor %}
+    </div>
     {% if jokes %}
       {% for j in jokes %}
       <div class="joke-card">
@@ -293,6 +361,21 @@ ALL_JOKES_HTML = """
     {% else %}
       <div class="empty-state">No roasts yet. Go generate some!</div>
     {% endif %}
+    {% if total_pages > 1 %}
+    <div class="pagination">
+      {% if page > 1 %}
+        <a href="/all-jokes?page={{ page - 1 }}{{ '&style=' + style_filter if style_filter else '' }}">&larr; Newer</a>
+      {% else %}
+        <span class="disabled">&larr; Newer</span>
+      {% endif %}
+      <span class="page-info">Page {{ page }} of {{ total_pages }}</span>
+      {% if page < total_pages %}
+        <a href="/all-jokes?page={{ page + 1 }}{{ '&style=' + style_filter if style_filter else '' }}">Older &rarr;</a>
+      {% else %}
+        <span class="disabled">Older &rarr;</span>
+      {% endif %}
+    </div>
+    {% endif %}
   </div>
 </body>
 </html>
@@ -301,24 +384,39 @@ ALL_JOKES_HTML = """
 
 @app.route("/all-jokes")
 def all_jokes():
-    jokes = []
-    for f in sorted(JOKES_DIR.glob("*.md"), reverse=True):
-        text = f.read_text()
-        # Extract joke from "> ..." blockquote line
-        joke_match = re.search(r"^> (.+)$", text, re.MULTILINE)
-        style_match = re.search(r"\*\*Style:\*\* (.+)", text)
-        # Parse timestamp from filename: YYYYMMDD-HHMMSS-...
-        ts_match = re.match(r"(\d{8})-(\d{6})", f.name)
-        time_str = ""
-        if ts_match:
-            d, t = ts_match.groups()
-            time_str = f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]} UTC"
-        jokes.append({
-            "joke": joke_match.group(1) if joke_match else "(parse error)",
-            "style": style_match.group(1).strip() if style_match else "",
-            "time": time_str,
-        })
-    return render_template_string(ALL_JOKES_HTML, jokes=jokes, count=len(jokes))
+    all_items = _get_jokes()
+
+    # --- Filtering ---
+    style_filter = request.args.get("style", "").strip()
+    if style_filter and style_filter in TECHNIQUES:
+        filtered = [j for j in all_items if j["style"] == style_filter]
+    else:
+        style_filter = ""
+        filtered = all_items
+
+    total = len(filtered)
+
+    # --- Pagination ---
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (ValueError, TypeError):
+        page = 1
+    total_pages = max(1, (total + JOKES_PER_PAGE - 1) // JOKES_PER_PAGE)
+    page = min(page, total_pages)
+
+    start = (page - 1) * JOKES_PER_PAGE
+    page_jokes = filtered[start : start + JOKES_PER_PAGE]
+
+    return render_template_string(
+        ALL_JOKES_HTML,
+        jokes=page_jokes,
+        count=total,
+        total_all=len(all_items),
+        page=page,
+        total_pages=total_pages,
+        style_filter=style_filter,
+        techniques=TECHNIQUES,
+    )
 
 
 if __name__ == "__main__":
